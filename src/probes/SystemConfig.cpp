@@ -29,6 +29,9 @@ void ProbePower(SystemConfig& s) {
     DWORD v = 0;
     if (PowerReadACValueIndex(nullptr, active, &kSubPciExpress, &kAspmPolicy, &v) == ERROR_SUCCESS)
         s.aspmAC = (int)v;
+    static const GUID kSubProc = {0x54533251, 0x82be, 0x4824, {0x96, 0xc1, 0x47, 0xb6, 0x0b, 0x74, 0x0d, 0x00}};
+    static const GUID kCpMin = {0x0cc5b647, 0xc1df, 0x4637, {0x89, 0x1a, 0xde, 0xc3, 0x5c, 0x31, 0x85, 0x83}};
+    if (PowerReadACValueIndex(nullptr, active, &kSubProc, &kCpMin, &v) == ERROR_SUCCESS) s.cpMinCoresAC = (int)v;
     LocalFree(active);
 }
 

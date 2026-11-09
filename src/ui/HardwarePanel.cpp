@@ -264,6 +264,16 @@ void AddSystemRows(App& app, std::vector<HwRow>& rows) {
                     s.aspmAC == 0   ? Verdict{Status::Ok, "link power management off"}
                     : s.aspmAC > 0  ? Verdict{Status::Warn, "link power management can add latency to GPU hand-offs"}
                                     : Verdict{Status::Unavailable, "could not read"}});
+    // Core parking: forcing every core unparked keeps idle E-cores from sleeping; measured -13% generation speed on a
+    // hybrid CPU (repeated A/B with powercfg only).
+    if (app.cpu.hybrid && s.cpMinCoresAC >= 0)
+        rows.push_back({S, "Core parking", s.cpMinCoresAC >= 100 ? "off (all cores kept awake)" : std::format("allowed (min {}% unparked)", s.cpMinCoresAC),
+                        "power plan setting CPMINCORES",
+                        s.cpMinCoresAC >= 100
+                            ? Verdict{Status::Warn, "every core is kept unparked, so idle E-cores never sleep: measured 13% slower "
+                                                    "generation. Allow parking again, e.g.: powercfg /setacvalueindex SCHEME_CURRENT "
+                                                    "SUB_PROCESSOR CPMINCORES 10 && powercfg /setactive SCHEME_CURRENT"}
+                            : Verdict{Status::Ok, "idle cores can park"}});
     Verdict lp{Status::Unavailable, "could not determine"};
     std::string lpv = "unknown";
     if (s.lockPagesKnown) {

@@ -343,7 +343,7 @@ On startup, a leftover journal means a crash: offer "Restore previous system sta
 | Services | SCM: `QueryServiceStatusEx`, `ControlService(STOP)`; restore = start only if it was running | prior running state (start type untouched) | SysMain, UsoSvc, wuauserv, BITS, DoSvc, WSearch, DiagTrack, dmwappush, WerSvc. WaaSMedicSvc is protected (skip). |
 | Scheduled tasks | Task Scheduler COM `ITaskService` → `IRegisteredTask::put_Enabled(FALSE)` | re-enable those we disabled | Defrag\ScheduledDefrag, Windows Defender\Scheduled Scan, UpdateOrchestrator\Schedule Scan(+Static), CEIP\Consolidator+UsbCeip, DiskDiagnostic\DataCollector, Maintenance\WinSAT, WindowsAI\* |
 | Defender exclusions | WMI `root\Microsoft\Windows\Defender` `MSFT_MpPreference.Add(ExclusionPath/ExclusionProcess)` | `Remove(...)` of exactly what we added | Requires Tamper Protection off. Warns about the security trade-off; detects third-party AV. |
-| Power | `PowerSetActiveScheme` (High/Ultimate), `PowerWriteACValueIndex` CPMINCORES=100 (core parking off), ASPM=0 | prior scheme + values | |
+| Power | `PowerSetActiveScheme` (High/Ultimate), `PowerWriteACValueIndex` ASPM=0. **Core parking is never turned off** (see §18e); if the plan we switch to has CPMINCORES=100 on a hybrid CPU, the previous plan's value is carried over | prior scheme + values | |
 | Background apps | HKCU `...\BackgroundAccessApplications\GlobalUserDisabled=1` | prior value | P2 |
 | Interrupt affinity (advanced) | `HKLM\SYSTEM\CurrentControlSet\Enum\<dev>\Device Parameters\Interrupt Management\Affinity Policy` (DevicePolicy=4, AssignmentSetOverride=E-mask) | delete keys | permanent, reboot; P2 |
 
@@ -484,6 +484,10 @@ Collectors (NVML 100 ms, PDH 250 ms, process scan 2 s, emon 0.5 s) cost nothing 
 ## 18d. Hardware-accelerated GPU scheduling
 
 On a test machine (MoE model split between CPU and GPU), turning HAGS on (HwSchMode 1 -> 2, reboot) made generation ~15% faster with identical llama.cpp flags. About half of each token's time was not explained by CPU or GPU weight reads, and DRAM traffic was only about a third of the measured maximum. With HAGS off, Windows queues each GPU command on the CPU, adding latency to each of the ~70 CPU<->GPU hand-offs per token. The Hardware panel now checks it (off = Warn, with the setting path and the reboot requirement).
+
+## 18e. Core parking off costs speed on hybrid CPUs
+
+Repeated A/B with `powercfg` only (no LlamaScope), llama-bench generation with weights locked in RAM: forcing all cores unparked (CPMINCORES 100) was 13% slower than allowing parking (4%), in both repetitions (A B A B, spread under 0.5%). Inference mode originally set CPMINCORES=100 and therefore cost exactly this much. Likely cause: idle E-cores can no longer reach deep sleep states, taking power/ring headroom from the busy P-cores (not measured directly). Inference mode now leaves parking alone, and the Hardware panel flags parking forced off on hybrid CPUs. Method note: llama-bench with memory-mapped weights (default) pages in the CPU-side weights during the measurement and is not comparable across processes; use `-lm mlock`.
 
 ## 19. Open design questions
 

@@ -179,7 +179,42 @@ int RunImcProbe() {
     return ys.empty() ? 4 : 0;
 }
 
+// Headless: hold inference mode with only the listed actions (comma-separated ids, e.g. "isolate,power") until
+// %LOCALAPPDATA%\LlamaScope\im-hold.stop appears, then restore. Used to measure each action's effect on t/s.
+int RunInferenceModeHold(const std::wstring& actions) {
+    CpuTopology cpu = CpuTopology::Probe();
+    Affinity::RestrictToECores(cpu);
+    Settings s;
+    s.Load();
+    InferenceMode im;
+    im.SetContext(cpu, s.modelPath);
+    auto wait = [&] { while (im.Busy()) Sleep(100); };
+    if (im.LeftoverJournal()) { im.RestoreAsync(); wait(); }
+    std::string list = "," + ToUtf8(actions) + ",";
+    for (const auto& a : im.Actions()) im.SetEnabled(a.id, list.find("," + a.id + ",") != std::string::npos);
+    std::wstring stop = LocalDataDir() + L"\\im-hold.stop";
+    // The caller clears the stop file before launching; deleting it here could swallow an early stop request.
+    im.EnterAsync();
+    wait();
+    Log::I("im-hold: active with " + ToUtf8(actions));
+    while (GetFileAttributesW(stop.c_str()) == INVALID_FILE_ATTRIBUTES) Sleep(200);
+    DeleteFileW(stop.c_str());
+    im.RestoreAsync();
+    wait();
+    Log::I(std::format("im-hold: restored, active={}", im.Active()));
+    return im.Active() ? 3 : 0;
+}
+
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int) {
+    if (cmdLine) {
+        std::wstring cl = cmdLine;
+        size_t k = cl.find(L"--im-hold=");
+        if (k != std::wstring::npos) {
+            std::wstring v = cl.substr(k + 10);
+            v = v.substr(0, v.find(L' '));
+            return RunInferenceModeHold(v);
+        }
+    }
     if (cmdLine && wcsstr(cmdLine, L"--imc-probe")) return RunImcProbe();
     if (cmdLine && wcsstr(cmdLine, L"--selftest")) return RunSelfTest();
     if (cmdLine && wcsstr(cmdLine, L"--im-roundtrip")) return RunInferenceModeRoundTrip(wcsstr(cmdLine, L"--memtest") != nullptr);

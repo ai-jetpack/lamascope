@@ -171,7 +171,7 @@ InferenceMode::InferenceMode() {
          "Disables defrag, Defender scheduled scan, update scans, CEIP, disk diagnostics, WinSAT and Windows AI tasks so they cannot start mid-inference. Re-enabled on restore.",
          "low", true, false, ""},
         {"power", "Performance power settings",
-         "High performance plan, no core parking, PCIe link power saving off. Uses more power while active.",
+         "High performance plan and PCIe link power saving off. Core parking is deliberately left alone: forcing all cores unparked measured 13% slower generation on a hybrid CPU (idle E-cores can no longer sleep).",
          "low", true, false, ""},
         {"bgapps", "Pause Store apps in the background", "Stops Microsoft Store apps from running in the background.",
          "low", true, false, ""},
@@ -362,7 +362,13 @@ void InferenceMode::Enter() {
             disabledTasks_.push_back(ToUtf8(t));
             SaveJournal();
             std::string shortName = ToUtf8(t).substr(ToUtf8(t).find_last_of('\\') + 1);
-            Note(SetTask(t, false) ? "paused task " + shortName : "could not pause task " + shortName + " (protected)");
+            if (SetTask(t, false)) {
+                Note("paused task " + shortName);
+            } else {   // protected: still enabled, nothing to restore
+                disabledTasks_.pop_back();
+                SaveJournal();
+                Note("could not pause task " + shortName + " (protected)");
+            }
         }
     }
     if (On("power")) {
@@ -377,13 +383,26 @@ void InferenceMode::Enter() {
             }
             tunedScheme_ = GuidStr(target);
             DWORD v = 0;
-            if (PowerReadACValueIndex(nullptr, &target, &kSubProcessor, &kCpMinCores, &v) == ERROR_SUCCESS) origCpMinCores_ = (int)v;
+            // Core parking (CPMINCORES) is not changed on purpose: unparking all cores measured -13% t/s (idle
+            // E-cores can no longer sleep). But the stock High performance plan often has parking off (100), so when
+            // we switched plans on a hybrid CPU, carry over the previous plan's value (journaled, restored).
+            if (cpu_.hybrid && !IsEqualGUID(target, StrGuid(origScheme_)) &&
+                PowerReadACValueIndex(nullptr, &target, &kSubProcessor, &kCpMinCores, &v) == ERROR_SUCCESS && v >= 100) {
+                GUID prev = StrGuid(origScheme_);
+                DWORD pv = 10;
+                PowerReadACValueIndex(nullptr, &prev, &kSubProcessor, &kCpMinCores, &pv);
+                if (pv < 100) {
+                    origCpMinCores_ = (int)v;
+                    SaveJournal();
+                    PowerWriteACValueIndex(nullptr, &target, &kSubProcessor, &kCpMinCores, pv);
+                    Note(std::format("kept core parking allowed (min {}% unparked, as in the previous plan)", pv));
+                }
+            }
             if (PowerReadACValueIndex(nullptr, &target, &kSubPcie, &kAspm, &v) == ERROR_SUCCESS) origAspm_ = (int)v;
             SaveJournal();
-            PowerWriteACValueIndex(nullptr, &target, &kSubProcessor, &kCpMinCores, 100);
             PowerWriteACValueIndex(nullptr, &target, &kSubPcie, &kAspm, 0);
             PowerSetActiveScheme(nullptr, &target);
-            Note("core parking off, PCIe power saving off");
+            Note("PCIe power saving off");
         }
     }
     if (On("bgapps")) {
