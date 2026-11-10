@@ -1,6 +1,7 @@
 // LlamaScope entry point: Win32 window + Direct3D 11 + Dear ImGui frame loop.
 #include <windows.h>
 #include <d3d11.h>
+#include <wincodec.h>
 #include <format>
 #include <string>
 #include "app/App.h"
@@ -87,6 +88,52 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+// Saves the current back buffer (RGBA8) as a PNG through WIC. Used by --snapshot.
+bool SaveBackBuffer(const std::wstring& path) {
+    ID3D11Texture2D* back = nullptr;
+    if (FAILED(g_swapChain->GetBuffer(0, IID_PPV_ARGS(&back)))) return false;
+    D3D11_TEXTURE2D_DESC d;
+    back->GetDesc(&d);
+    d.Usage = D3D11_USAGE_STAGING;
+    d.BindFlags = 0;
+    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    d.MiscFlags = 0;
+    ID3D11Texture2D* staging = nullptr;
+    bool ok = SUCCEEDED(g_device->CreateTexture2D(&d, nullptr, &staging));
+    if (ok) g_context->CopyResource(staging, back);
+    back->Release();
+    D3D11_MAPPED_SUBRESOURCE m{};
+    ok = ok && SUCCEEDED(g_context->Map(staging, 0, D3D11_MAP_READ, 0, &m));
+    IWICImagingFactory* wic = nullptr;
+    IWICStream* stream = nullptr;
+    IWICBitmapEncoder* enc = nullptr;
+    IWICBitmapFrameEncode* frame = nullptr;
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    ok = ok && SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic)));
+    ok = ok && SUCCEEDED(wic->CreateStream(&stream)) && SUCCEEDED(stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE));
+    ok = ok && SUCCEEDED(wic->CreateEncoder(GUID_ContainerFormatPng, nullptr, &enc)) &&
+         SUCCEEDED(enc->Initialize(stream, WICBitmapEncoderNoCache)) && SUCCEEDED(enc->CreateNewFrame(&frame, nullptr)) &&
+         SUCCEEDED(frame->Initialize(nullptr)) && SUCCEEDED(frame->SetSize(d.Width, d.Height));
+    // swap to BGRA, which the PNG encoder takes natively
+    std::vector<BYTE> px;
+    if (ok) {
+        px.resize((size_t)m.RowPitch * d.Height);
+        memcpy(px.data(), m.pData, px.size());
+        for (UINT y = 0; y < d.Height; ++y)
+            for (UINT x = 0; x < d.Width; ++x) std::swap(px[(size_t)y * m.RowPitch + x * 4], px[(size_t)y * m.RowPitch + x * 4 + 2]);
+    }
+    WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
+    ok = ok && SUCCEEDED(frame->SetPixelFormat(&fmt)) &&
+         SUCCEEDED(frame->WritePixels(d.Height, m.RowPitch, m.RowPitch * d.Height, px.data())) &&
+         SUCCEEDED(frame->Commit()) && SUCCEEDED(enc->Commit());
+    if (frame) frame->Release();
+    if (enc) enc->Release();
+    if (stream) stream->Release();
+    if (wic) wic->Release();
+    if (staging) { g_context->Unmap(staging, 0); staging->Release(); }
+    return ok;
 }
 
 void ApplyTheme(float scale) {
@@ -205,8 +252,40 @@ int RunInferenceModeHold(const std::wstring& actions) {
     return im.Active() ? 3 : 0;
 }
 
+// Headless: load a ggml profile and log the per-layer aggregation (checks the reader without the UI).
+int RunProfileDump(const std::wstring& path) {
+    ProfileData p = ProfileData::Load(path);
+    if (!p.ok) { Log::E("profile-dump: " + p.error); return 5; }
+    Log::I(std::format("profile-dump: steps {} prompt-graphs {} threads {} step {:.0f} us | cpu {:.0f} gpu {:.0f} copy {:.0f} sync {:.0f} us | gpu markers {} | experts {}x{}",
+                       p.genSteps, p.promptGraphs, p.threads, p.stepUs, p.cpuBusyUs, p.gpuBusyUs, p.copyUs, p.syncUs,
+                       p.hasGpu, p.genCounts.size(), p.nExperts));
+    Log::I(std::format("profile-dump: hand-offs {:.0f} us, main thread waiting for GPU {:.0f} us, other {:.0f} us per step",
+                       p.handoffUs, p.waitGpuUs, p.stepUs - p.cpuBusyUs - p.gpuBusyUs - p.handoffUs));
+    for (const auto& c : p.copies)
+        Log::I(std::format("profile-dump: copy {} {} x{:.0f}/token {} B path {} sync {:.1f} us copy {:.1f} us", c.tensor,
+                           c.toCpu ? "GPU->CPU" : "CPU->GPU", c.perStep, c.bytes, c.path, c.syncUs, c.copyUs));
+    for (size_t L = 0; L < p.layers.size(); ++L) {
+        const auto& ly = p.layers[L];
+        std::string s;
+        for (size_t b = 0; b < (size_t)ProfBlock::Count; ++b)
+            if (ly.cpuUs[b] > 0.5 || ly.gpuUs[b] > 0.5)
+                s += std::format(" {}: gpu {:.0f} cpu {:.0f} ({:.0f}% wait);", ProfBlockName((ProfBlock)b), ly.gpuUs[b], ly.cpuUs[b], ly.spinPct[b]);
+        uint64_t picks = 0;
+        if (L < p.genCounts.size()) for (uint32_t c : p.genCounts[L]) picks += c;
+        Log::I(std::format("profile-dump: layer {:2}{} toCpu {:.0f} toGpu {:.0f} us, picks {}", L, s, ly.toCpuUs, ly.toGpuUs, picks));
+    }
+    return 0;
+}
+
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int) {
     if (cmdLine) {
+        std::wstring cl0 = cmdLine;
+        size_t pd = cl0.find(L"--profile-dump ");
+        if (pd != std::wstring::npos) {
+            std::wstring path = cl0.substr(pd + 15);
+            if (!path.empty() && path.front() == L'"') path = path.substr(1, path.find(L'"', 1) - 1);
+            return RunProfileDump(path);
+        }
         std::wstring cl = cmdLine;
         size_t k = cl.find(L"--im-hold=");
         if (k != std::wstring::npos) {
@@ -255,6 +334,26 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int) {
     App app;
     app.Init(firstRun);
     if (cmdLine && wcsstr(cmdLine, L"--run-tests")) app.hwCheck.startAt = NowSeconds() + 5;   // after startup settles
+    if (cmdLine && wcsstr(cmdLine, L"--topology-scroll ")) g_topologyScroll = (float)_wtof(wcsstr(cmdLine, L"--topology-scroll ") + 18);
+    if (cmdLine && wcsstr(cmdLine, L"--summary-scroll ")) g_summaryScroll = (float)_wtof(wcsstr(cmdLine, L"--summary-scroll ") + 17);
+    if (cmdLine && wcsstr(cmdLine, L"--profile-latest")) app.LoadLatestProfile();
+    else if (cmdLine && wcsstr(cmdLine, L"--profile ")) {
+        std::wstring p = wcsstr(cmdLine, L"--profile ") + 10;
+        if (!p.empty() && p.front() == L'"') p = p.substr(1, p.find(L'"', 1) - 1);
+        else p = p.substr(0, p.find(L' '));
+        app.LoadProfile(p);
+    }
+
+    // --snapshot <file.png> [--snapshot-after <seconds>]: render (even when occluded), save the back buffer, exit.
+    std::wstring snapshot;
+    double snapshotAt = 0;
+    if (cmdLine && wcsstr(cmdLine, L"--snapshot ")) {
+        snapshot = wcsstr(cmdLine, L"--snapshot ") + 11;
+        if (!snapshot.empty() && snapshot.front() == L'"') snapshot = snapshot.substr(1, snapshot.find(L'"', 1) - 1);
+        else snapshot = snapshot.substr(0, snapshot.find(L' '));
+        const wchar_t* after = wcsstr(cmdLine, L"--snapshot-after ");
+        snapshotAt = NowSeconds() + (after ? _wtof(after + 17) : 8.0);
+    }
 
     bool done = false;
     while (!done) {
@@ -276,7 +375,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int) {
         }
         if (done) break;
 
-        if (g_occluded && g_swapChain->Present(0, DXGI_PRESENT_TEST) == DXGI_STATUS_OCCLUDED) {
+        if (snapshot.empty() && g_occluded && g_swapChain->Present(0, DXGI_PRESENT_TEST) == DXGI_STATUS_OCCLUDED) {
             Sleep(50);
             continue;
         }
@@ -300,6 +399,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int) {
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
         // vsync; the UI shares the GPU with inference, so keep it cheap.
+        if (!snapshot.empty() && NowSeconds() >= snapshotAt) {
+            bool ok = SaveBackBuffer(snapshot);
+            Log::I(std::string("snapshot ") + (ok ? "saved: " : "FAILED: ") + ToUtf8(snapshot));
+            done = true;
+        }
         HRESULT hr = g_swapChain->Present(1, 0);
         g_occluded = hr == DXGI_STATUS_OCCLUDED;
     }

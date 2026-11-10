@@ -8,6 +8,7 @@
 #include "core/Log.h"
 #include "core/Util.h"
 #include "imgui.h"
+#include "implot.h"
 #include "ui/Panels.h"
 
 namespace {
@@ -30,6 +31,134 @@ ImU32 DevCol(Device d, float a = 1.0f) {
     return ImGui::GetColorU32(c);
 }
 const char* DevName(Device d) { return d == Device::Gpu ? "GPU" : "CPU"; }
+
+std::string Us(double v);
+
+std::wstring BrowseForProfile() {
+    wchar_t file[MAX_PATH] = {};
+    std::wstring dir = App::ProfilesDir();
+    OPENFILENAMEW ofn{sizeof(ofn)};
+    ofn.lpstrFilter = L"ggml profiles\0*.prof\0All files\0*.*\0";
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrInitialDir = dir.c_str();
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    return GetOpenFileNameW(&ofn) ? std::wstring(file) : std::wstring();
+}
+
+// Measured runtime (ggml profiler output): totals per generation step and expert usage across all layers.
+void DrawProfileSummary(App& app, const ModelInfo& m) {
+    ImGui::SeparatorText("Runtime profile (measured)");
+    if (ImGui::Button("Open profile...")) {
+        std::wstring p = BrowseForProfile();
+        if (!p.empty()) app.LoadProfile(p);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Load latest") && !app.LoadLatestProfile())
+        app.profile = ProfileData{false, "no .prof files in " + ToUtf8(App::ProfilesDir())};
+    const ProfileData& pr = app.profile;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Run a patched llama.cpp with GGML_PROFILE=block (or op) and\nGGML_PROFILE_FILE=%s\\<name>.prof", ToUtf8(App::ProfilesDir()).c_str());
+    if (!pr.ok) {
+        if (!pr.error.empty()) ImGui::TextColored(StatusColor(Status::Warn), "%s", pr.error.c_str());
+        else ImGui::TextDisabled("No profile loaded. Times per block, PCIe latencies and expert usage appear on the diagram once one is loaded.");
+        return;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Clear")) { app.profile = ProfileData{}; return; }
+    std::string file = pr.path.substr(pr.path.find_last_of("\\/") + 1);
+    ImGui::TextDisabled("%s: %d generation steps averaged, %d CPU threads, %s mode%s", file.c_str(), pr.genSteps, pr.threads,
+                        pr.level == 2 ? "op" : "block", pr.dropped ? std::format(", {} entries dropped", pr.dropped).c_str() : "");
+    if (pr.nExperts && m.nExpert && pr.nExperts > m.nExpert)
+        ImGui::TextColored(StatusColor(Status::Warn), "The profile has %d experts per layer, the selected model %u: wrong model?", pr.nExperts, m.nExpert);
+
+    const double step = pr.stepUs;
+    if (pr.genSteps == 0) ImGui::TextDisabled("Expert counts only (no timing in this profile).");
+    if (pr.genSteps > 0) {
+    ImGui::Text("Per generated token: %s (%.1f tokens/s)", Us(step).c_str(), step > 0 ? 1e6 / step : 0.0);
+    auto row = [&](const char* label, double v, const char* tip) {
+        ImGui::BulletText("%s: %s (%.0f%%)", label, Us(v).c_str(), step > 0 ? v / step * 100 : 0.0);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+    };
+    // Non-overlapping parts of a step (they add up to the step, the remainder is launch/scheduling overhead).
+    row("CPU busy (experts on the CPU)", pr.cpuBusyUs, "Thread 0 wall time in CPU blocks: computing plus waiting for the other threads at each step.");
+    if (pr.hasGpu) row("GPU busy", pr.gpuBusyUs, "Sum of GPU block times from marker kernels.");
+    if (pr.hasGpu) {
+        row("PCIe hand-offs", pr.handoffUs, "Copies between CPU and GPU, counted from the moment the GPU finished (the PCIe labels on the diagram).");
+        double other = pr.stepUs - pr.cpuBusyUs - pr.gpuBusyUs - pr.handoffUs;
+        row("Other (launches, scheduling, unmeasured)", std::max(0.0, other), "Step time not covered by the rows above: kernel launches, graph replay, scheduler bookkeeping.");
+        ImGui::TextDisabled("Main thread blocked until the GPU finished: %s per token (already part of GPU busy).", Us(pr.waitGpuUs).c_str());
+    } else {
+        row("Copies and waits for the GPU", pr.copyUs, "Input copies of each split, including waiting for the GPU (no GPU markers in this profile to separate them).");
+    }
+    if (pr.syncUs > 0) row("Explicit syncs", pr.syncUs, "ggml_backend_synchronize calls between splits.");
+
+    // Hand-off details: every input tensor copied between devices.
+    if (!pr.copies.empty() && ImGui::TreeNode("Hand-off details (each copied tensor)")) {
+        static const char* paths[] = {"async", "sync + blocking copy", "user input", "callback"};
+        if (ImGui::BeginTable("##copies", 7, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_Borders)) {
+            for (const char* h : {"tensor", "direction", "per token", "bytes", "how", "sync / copy (each)", "per token total"})
+                ImGui::TableSetupColumn(h);
+            ImGui::TableHeadersRow();
+            for (const auto& c : pr.copies) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(c.tensor.c_str());
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(c.toCpu ? "GPU -> CPU" : "CPU -> GPU");
+                ImGui::TableNextColumn(); ImGui::Text("%.0f", c.perStep);
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(c.bytes ? MB((double)c.bytes).c_str() : "?");
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(paths[std::clamp(c.path, 0, 3)]);
+                ImGui::TableNextColumn(); ImGui::Text("%s / %s", Us(c.syncUs).c_str(), Us(c.copyUs).c_str());
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(Us(c.perStep * (c.syncUs + c.copyUs)).c_str());
+            }
+            ImGui::EndTable();
+        }
+        ImGui::TextDisabled("\"sync\" = waiting in ggml_backend_synchronize before the copy (for the first input of a CPU split this\nincludes the GPU finishing its work); \"copy\" = the blocking data copy itself.");
+        ImGui::TreePop();
+    }
+
+    // Spin share over all CPU blocks
+    double tot = 0, wsum = 0;
+    for (const auto& L : pr.layers)
+        for (size_t b = 0; b < (size_t)ProfBlock::Count; ++b) { tot += L.cpuUs[b]; wsum += L.cpuUs[b] * L.spinPct[b] / 100; }
+    if (tot > 0) ImGui::BulletText("CPU threads waiting at barriers: %.0f%% of their time in CPU blocks", wsum / tot * 100);
+    }
+
+    // Expert usage heatmap: rows = layers, columns = experts.
+    static bool prompt = false;
+    const auto& counts = prompt ? pr.promptCounts : pr.genCounts;
+    if (!counts.empty() && pr.nExperts > 0) {
+        ImGui::Checkbox("Prompt processing instead of generation", &prompt);
+        static std::vector<float> heat;
+        const int rows = (int)counts.size(), cols = pr.nExperts;
+        heat.assign((size_t)rows * cols, 0);
+        float mx = 0;
+        for (int l = 0; l < rows; ++l) {
+            uint64_t t = 0;
+            for (uint32_t c : counts[l]) t += c;
+            for (int e = 0; e < cols; ++e) {
+                float v = t ? (float)counts[l][e] / t * 100.0f : 0;   // % of this layer's picks
+                heat[(size_t)l * cols + e] = v;
+                mx = std::max(mx, v);
+            }
+        }
+        if (ImPlot::BeginPlot("##experts", ImVec2(-1, std::max(ImGui::GetFontSize() * 14, rows * 4.0f)), ImPlotFlags_NoMouseText | ImPlotFlags_NoLegend)) {
+            ImPlot::SetupAxes("expert", "layer", ImPlotAxisFlags_None, ImPlotAxisFlags_Invert);
+            ImPlot::SetupAxesLimits(0, cols, 0, rows, ImPlotCond_Always);
+            ImPlot::PushColormap(ImPlotColormap_Hot);
+            ImPlot::PlotHeatmap("##h", heat.data(), rows, cols, 0, mx, nullptr, ImPlotPoint(0, rows), ImPlotPoint(cols, 0));
+            ImPlot::PopColormap();
+            if (ImPlot::IsPlotHovered()) {
+                ImPlotPoint mp = ImPlot::GetPlotMousePos();
+                int e = std::clamp((int)mp.x, 0, cols - 1), l = std::clamp((int)mp.y, 0, rows - 1);
+                ImGui::SetTooltip("layer %d, expert #%d: %u picks (%.2f%% of the layer's picks)", l, e, counts[l][e], heat[(size_t)l * cols + e]);
+            }
+            ImPlot::EndPlot();
+        }
+        int never = 0;
+        for (const auto& r : counts) for (uint32_t c : r) never += c == 0;
+        ImGui::TextDisabled("Brighter = picked more often. %d of %d expert slots were never picked in this run.", never, rows * cols);
+    }
+}
 
 std::wstring BrowseForModel() {
     wchar_t file[MAX_PATH] = {};
@@ -143,6 +272,56 @@ void Tip(const std::vector<std::string>& lines) {
     ImGui::EndTooltip();
 }
 
+// Runtime profile overlay (GGML_PROFILE): time badges, PCIe latencies, expert usage strip.
+const ImU32 kBadge = IM_COL32(255, 214, 120, 255);
+std::string Us(double v) {
+    return v >= 1000 ? std::format("{:.2f} ms", v / 1000) : std::format("{:.0f} \u00b5s", v);
+}
+void Badge(ImDrawList* dl, ImVec2 at, const std::string& s) {
+    ImVec2 sz = ImGui::CalcTextSize(s.c_str());
+    dl->AddRectFilled(ImVec2(at.x - 3, at.y - 1), ImVec2(at.x + sz.x + 3, at.y + sz.y + 1), IM_COL32(60, 48, 20, 230), 3.0f);
+    dl->AddText(at, kBadge, s.c_str());
+}
+const ProfileData::Layer* ProfLayer(const ProfileData* pr, int li) {
+    return pr && pr->ok && li < (int)pr->layers.size() ? &pr->layers[li] : nullptr;
+}
+std::string BlockTime(const ProfileData::Layer& L, ProfBlock b) {
+    double g = L.gpuUs[(size_t)b], c = L.cpuUs[(size_t)b];
+    std::string s;
+    if (g > 0.5) s += "GPU " + Us(g);
+    if (c > 0.5) s += (s.empty() ? "" : " + ") + std::string("CPU ") + Us(c) + std::format(" ({:.0f}% waiting)", L.spinPct[(size_t)b]);
+    return s;
+}
+// One thin cell per expert, brighter = picked more often during generation.
+void ExpertStrip(ImDrawList* dl, ImVec2 a, float w, float h, const std::vector<uint32_t>& counts, int layer) {
+    uint32_t mx = 0;
+    uint64_t total = 0;
+    for (uint32_t c : counts) { mx = std::max(mx, c); total += c; }
+    if (!mx) return;
+    const int n = (int)counts.size();
+    const float cw = w / n;
+    for (int e = 0; e < n; ++e) {
+        float t = std::sqrt((float)counts[e] / mx);
+        ImU32 col = counts[e] ? ImGui::ColorConvertFloat4ToU32(ImVec4(0.25f + 0.75f * t, 0.18f + 0.6f * t, 0.10f, 1)) : IM_COL32(35, 38, 45, 255);
+        dl->AddRectFilled(ImVec2(a.x + e * cw, a.y), ImVec2(a.x + (e + 1) * cw, a.y + h), col);
+    }
+    dl->AddRect(a, ImVec2(a.x + w, a.y + h), IM_COL32(255, 255, 255, 60));
+    if (ImGui::IsMouseHoveringRect(a, ImVec2(a.x + w, a.y + h))) {
+        int e = std::clamp((int)((ImGui::GetMousePos().x - a.x) / cw), 0, n - 1);
+        std::vector<int> idx(n);
+        for (int i = 0; i < n; ++i) idx[i] = i;
+        std::partial_sort(idx.begin(), idx.begin() + std::min(5, n), idx.end(), [&](int x, int y) { return counts[x] > counts[y]; });
+        std::vector<std::string> t = {std::format("Layer {}: expert #{} picked {} times ({:.2f}% of picks)", layer, e, counts[e], 100.0 * counts[e] / total)};
+        int unused = 0;
+        for (uint32_t c : counts) unused += c == 0;
+        t.push_back(std::format("{} of {} experts never picked in this run", unused, n));
+        t.push_back("Most used:");
+        for (int k = 0; k < std::min(5, n); ++k)
+            t.push_back(std::format("  #{}: {:.2f}%", idx[k], 100.0 * counts[idx[k]] / total));
+        Tip(t);
+    }
+}
+
 std::vector<std::string> TensorLines(const LayerInfo& L, Block b) {
     std::vector<std::string> out;
     for (const auto& t : L.tensors[(int)b])
@@ -223,9 +402,10 @@ Device moeDev(const ModelInfo& m, const Placement& pl, int li) {
     return pl.dev[li][m.layers[li].bytes[(int)Block::Experts] ? (int)Block::Experts : (int)Block::DenseFfn];
 }
 
-void DrawLayerDiagram(const ModelInfo& m, const Placement& pl, const LaunchParams& lp, int li) {
+void DrawLayerDiagram(const ModelInfo& m, const Placement& pl, const LaunchParams& lp, int li, const ProfileData* pr) {
     const LayerInfo& L = m.layers[li];
     const auto& d = pl.dev[li];
+    const ProfileData::Layer* P = ProfLayer(pr, li);
     const float f = ImGui::GetFontSize();
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 o = ImGui::GetCursorScreenPos();
@@ -246,6 +426,11 @@ void DrawLayerDiagram(const ModelInfo& m, const Placement& pl, const LaunchParam
         Device exd = moeDev(m, pl, li);
         std::string h = std::format("Layer {}   |   context stage on {}   |   experts on {}   |   {}", li, DevName(md),
                                     DevName(exd), attn ? "has a KV cache" : "fixed-size state");
+        if (P) {
+            double g = 0, c = 0;
+            for (size_t b = 0; b < (size_t)ProfBlock::Count; ++b) { g += P->gpuUs[b]; c += P->cpuUs[b]; }
+            h += std::format("   |   measured per token: GPU {}, CPU {}", Us(g), Us(c));
+        }
         ImVec2 a(o.x, y), b(o.x + W, y + f * 1.5f);
         dl->AddRectFilled(a, b, IM_COL32(40, 46, 58, 255), 3.0f);
         dl->AddText(ImVec2(a.x + f * 0.5f, a.y + f * 0.25f), IM_COL32(220, 225, 235, 255), h.c_str());
@@ -314,6 +499,10 @@ void DrawLayerDiagram(const ModelInfo& m, const Placement& pl, const LaunchParam
     ImVec2 fa(A.a.x - f * 0.5f, stepTop - f * 0.35f), fb(C.b.x + f * 0.5f, C.b.y + f * 0.35f);
     dl->AddRect(fa, fb, IM_COL32(255, 255, 255, 45), 6.0f, 0, 1.0f);
     dl->AddText(ImVec2(fa.x + 4, fa.y - f * 1.05f), kSub, "Context stage");
+    if (P) {
+        std::string t = BlockTime(*P, ProfBlock::Attention);
+        if (!t.empty()) Badge(dl, ImVec2(fa.x + 4 + ImGui::CalcTextSize("Context stage").x + f * 0.6f, fa.y - f * 1.05f), t);
+    }
 
     // The store, to the right, with its write and read arrows.
     float sx = fb.x + f * 3.2f, sw = std::min(f * 11, o.x + W - sx - f * 0.5f);
@@ -385,6 +574,10 @@ void DrawLayerDiagram(const ModelInfo& m, const Placement& pl, const LaunchParam
                  std::format("Picks which {} of the {} experts process this token, and how much each one counts.", m.nExpertUsed, m.nExpert),
                  "A different set is picked for every token, so all experts must stay loaded."});
         Edge(dl, n2.Bottom(), rt.Top(), false);
+        if (P) {
+            std::string t = BlockTime(*P, ProfBlock::Router);
+            if (!t.empty()) Badge(dl, ImVec2(rt.b.x + f * 0.5f, rt.a.y + f * 0.6f), t);
+        }
         y = rt.b.y + vgap * 1.6f;
 
         // Experts: N routed + 1 shared, side by side. They run in parallel.
@@ -411,7 +604,10 @@ void DrawLayerDiagram(const ModelInfo& m, const Placement& pl, const LaunchParam
                                  MB((double)L.bytes[(int)Block::Experts]), ed == Device::Gpu ? "GPU" : "system"),
                      ed == Device::Cpu ? "On the CPU, their speed is limited by system memory bandwidth." : ""});
         }
-        if (fanPcie) PcieLabel(dl, ImVec2(cx + f * 0.3f, rt.b.y + (y - rt.b.y) * 0.45f), "PCIe: vector + expert choice to " + std::string(DevName(ed)));
+        if (fanPcie)
+            PcieLabel(dl, ImVec2(cx + f * 0.3f, rt.b.y + (y - rt.b.y) * 0.45f),
+                      "PCIe: vector + expert choice to " + std::string(DevName(ed)) +
+                          (P && P->toCpuUs > 0 ? "   [" + Us(P->toCpuUs) + "]" : ""));
         Rect sh{};
         if (L.bytes[(int)Block::Shared]) {
             float sx = ex0 + m.nExpertUsed * (ew + eg) - eg + sharedGap;
@@ -425,21 +621,42 @@ void DrawLayerDiagram(const ModelInfo& m, const Placement& pl, const LaunchParam
                 Tip({"Always-on expert (\"shared expert\"): processes every token, bypassing the dispatcher",
                      "Runs on the " + std::string(DevName(sd)) + ", in parallel with the picked experts"});
         }
+        if (P && sh.W() > 0) {
+            std::string t = BlockTime(*P, ProfBlock::Shared);
+            if (!t.empty()) Badge(dl, ImVec2(sh.a.x, sh.b.y + f * 0.2f), t);
+        }
         y += eh + vgap * 1.6f;
+        // Expert usage strip: space reserved here, drawn after the edges to the join so it sits on top of them.
+        const bool strip = pr && pr->ok && li < (int)pr->genCounts.size() && !pr->genCounts[li].empty();
+        const float stripY = y;
+        if (strip) y += f * 2.2f;
 
         // Join: weighted sum of the routed experts (computed where the experts are).
         sum = MakeRect(cx, y, std::min(W * 0.5f, f * 20), f * 2.2f);
         for (const auto& e : experts) Edge(dl, e.Bottom(), sum.Top(), false, 0.55f);
+        if (strip) {
+            std::string lbl = std::format("Expert usage in this layer ({} experts, brighter = picked more often)", pr->nExperts);
+            ImVec2 lp0(ex0, stripY - f * 0.9f), lsz = ImGui::CalcTextSize(lbl.c_str());
+            dl->AddRectFilled(ImVec2(lp0.x - 3, lp0.y - 1), ImVec2(lp0.x + lsz.x + 3, lp0.y + lsz.y + 1), ImGui::GetColorU32(ImGuiCol_ChildBg));
+            dl->AddText(lp0, kSub, lbl.c_str());
+            ExpertStrip(dl, ImVec2(ex0, stripY + f * 0.3f), rowW - f * 1.2f, f * 0.9f, pr->genCounts[li], li);
+        }
         if (Box(dl, sum, DevCol(ed), std::format("Join: merge {} expert results", m.nExpertUsed), "weighted by the dispatcher"))
             Tip({"Waits for all picked experts, then merges their outputs into one vector",
                  "Runs where the experts run (" + std::string(DevName(ed)) + ")"});
+        if (P) {
+            std::string t = BlockTime(*P, ProfBlock::Experts);
+            if (!t.empty()) Badge(dl, ImVec2(sum.b.x + f * 0.5f, sum.a.y + f * 0.5f), "experts: " + t);
+        }
         y = sum.b.y + vgap;
 
         // Combine routed + shared + residual on the layer device.
         ImVec2 add2(cx, y + r);
         bool backPcie = ed != ld;
         Edge(dl, sum.Bottom(), ImVec2(add2.x, add2.y - r), backPcie);
-        if (backPcie) PcieLabel(dl, ImVec2(cx, sum.b.y + (add2.y - r - sum.b.y) * 0.5f), "PCIe: result back to " + std::string(DevName(ld)));
+        if (backPcie)
+            PcieLabel(dl, ImVec2(cx, sum.b.y + (add2.y - r - sum.b.y) * 0.5f),
+                      "PCIe: result back to " + std::string(DevName(ld)) + (P && P->toGpuUs > 0 ? "   [" + Us(P->toGpuUs) + "]" : ""));
         if (sh.W() > 0) {
             dl->AddLine(sh.Bottom(), ImVec2(sh.Bottom().x, add2.y), kEdge, 1.4f);
             dl->AddLine(ImVec2(sh.Bottom().x, add2.y), ImVec2(add2.x + r + 4, add2.y), kEdge, 1.4f);
@@ -454,6 +671,10 @@ void DrawLayerDiagram(const ModelInfo& m, const Placement& pl, const LaunchParam
         SumNode(dl, add2, r, ld, "+");
         if (ImGui::IsMouseHoveringRect(ImVec2(add2.x - r, add2.y - r), ImVec2(add2.x + r, add2.y + r)))
             Tip({"Merge: picked experts + always-on expert + bypass path"});
+        if (P) {
+            std::string t = BlockTime(*P, ProfBlock::Merge);
+            if (!t.empty()) Badge(dl, ImVec2(add2.x + r + f * 0.6f, add2.y - f * 0.5f), "merge: " + t);
+        }
         y = add2.y + r + vgap;
         comb = {ImVec2(add2.x - r, add2.y - r), ImVec2(add2.x + r, add2.y + r)};
     } else {
@@ -580,15 +801,24 @@ void DrawSummary(App& app, const ModelInfo& m, LaunchParams& lp, const Placement
         if (m.nExpert && fit >= 0) ImGui::TextDisabled("Smallest --n-cpu-moe that fits (0.25 GB margin): %d", fit);
     }
 
-    ImGui::SeparatorText("Speed limit from memory bandwidth");
+    ImGui::SeparatorText("Bandwidth ceiling (upper bound, not a prediction)");
     bool measured = false;
     double cpuBw = CpuBandwidth(app, &measured), gpuBw = gs.VramGBs() * 1e9;
     double cpuMs = cpuBw > 0 ? pl.cpuBytesPerToken / cpuBw * 1000 : 0;
     double gpuMs = gpuBw > 0 ? pl.gpuBytesPerToken / gpuBw * 1000 : 0;
     ImGui::Text("CPU part >= %.1f ms  (%.0f GB/s%s)", cpuMs, cpuBw / 1e9, measured ? ", measured" : ", estimated");
     ImGui::Text("GPU part >= %.1f ms  (%.0f GB/s)", gpuMs, gpuBw / 1e9);
-    if (cpuMs + gpuMs > 0) ImGui::Text("At most %.0f tok/s", 1000.0 / (cpuMs + gpuMs));
-    ImGui::TextDisabled("Hand-off waits, kernel launches and thread sync come on top.");
+    if (cpuMs + gpuMs > 0) ImGui::Text("Ceiling: %.0f tok/s (%.1f ms per token)", 1000.0 / (cpuMs + gpuMs), cpuMs + gpuMs);
+    ImGui::TextDisabled("Only the time to read each token's weights once at full memory speed. Real speed is lower: "
+                        "compute below bandwidth peak, CPU<->GPU hand-offs, kernel launches, scheduling and thread sync "
+                        "come on top. Load a runtime profile to see the measured parts.");
+    if (app.profile.ok && app.profile.genSteps > 0 && cpuMs + gpuMs > 0) {
+        const ProfileData& pr = app.profile;
+        ImGui::Text("Measured (profile): %.0f tok/s = %.0f%% of the ceiling", 1e6 / pr.stepUs, (cpuMs + gpuMs) * 1000 / pr.stepUs * 100);
+        ImGui::TextDisabled("CPU %s vs %.1f ms ceiling, GPU %s vs %.1f ms ceiling, hand-offs %s, other %s", Us(pr.cpuBusyUs).c_str(), cpuMs,
+                            Us(pr.gpuBusyUs).c_str(), gpuMs, Us(pr.handoffUs).c_str(),
+                            Us(std::max(0.0, pr.stepUs - pr.cpuBusyUs - pr.gpuBusyUs - pr.handoffUs)).c_str());
+    }
 
     if (m.nExpert) {
         ImGui::SeparatorText("What if --n-cpu-moe ...");
@@ -598,7 +828,7 @@ void DrawSummary(App& app, const ModelInfo& m, LaunchParams& lp, const Placement
             ImGui::TableSetupColumn("N");
             ImGui::TableSetupColumn("GPU mem");
             ImGui::TableSetupColumn("fits");
-            ImGui::TableSetupColumn("max tok/s");
+            ImGui::TableSetupColumn("ceiling tok/s");
             ImGui::TableHeadersRow();
             for (int n = lo; n <= hi; ++n) {
                 LaunchParams q = lp;
@@ -625,6 +855,7 @@ void DrawSummary(App& app, const ModelInfo& m, LaunchParams& lp, const Placement
         ImGui::TextDisabled("N = number of layers whose experts stay on the CPU. Click a row to apply.");
     }
     ImGui::TextDisabled("Estimates; real buffer sizes come from the llama.cpp load log (M3).");
+    DrawProfileSummary(app, m);
     ImGui::PopTextWrapPos();
 }
 
@@ -736,7 +967,7 @@ void DrawTopologyPanel(App& app) {
                 if (height[i] > 0 && !ImGui::IsRectVisible(ImVec2(ImGui::GetContentRegionAvail().x, height[i]))) {
                     ImGui::SetCursorPosY(top[i] + height[i]);
                 } else {
-                    DrawLayerDiagram(m, pl, app.settings.launch, i);
+                    DrawLayerDiagram(m, pl, app.settings.launch, i, &app.profile);
                     height[i] = ImGui::GetCursorPosY() - top[i];
                 }
             }
@@ -751,6 +982,13 @@ void DrawTopologyPanel(App& app) {
                 ImGui::SetScrollY(top[scrollTo] - f * 0.5f);
                 scrollTo = -1;
             }
+            if (g_topologyScroll >= 0 && height[0] > 0) {
+                int li = std::clamp((int)g_topologyScroll, 0, L - 1);
+                if (height[li] > 0) {
+                    ImGui::SetScrollY(top[li] + (g_topologyScroll - li) * height[li]);
+                    g_topologyScroll = -1;
+                }
+            }
         }
         ImGui::EndChild();
     };
@@ -762,14 +1000,19 @@ void DrawTopologyPanel(App& app) {
         ImGui::TableNextColumn();
         flow(ImVec2(0, ImGui::GetContentRegionAvail().y));
         ImGui::TableNextColumn();
-        if (ImGui::BeginChild("##summary", ImVec2(0, ImGui::GetContentRegionAvail().y)))
+        if (ImGui::BeginChild("##summary", ImVec2(0, ImGui::GetContentRegionAvail().y))) {
             DrawSummary(app, m, app.settings.launch, pl);
+            if (g_summaryScroll >= 0 && ImGui::GetScrollMaxY() > 0) { ImGui::SetScrollY(g_summaryScroll * ImGui::GetScrollMaxY()); g_summaryScroll = -1; }
+        }
         ImGui::EndChild();
         ImGui::EndTable();
     } else {
         float h = ImGui::GetContentRegionAvail().y;
         flow(ImVec2(0, std::max(f * 20, h * 0.62f)));
-        if (ImGui::BeginChild("##summary", ImVec2(0, 0))) DrawSummary(app, m, app.settings.launch, pl);
+        if (ImGui::BeginChild("##summary", ImVec2(0, 0))) {
+            DrawSummary(app, m, app.settings.launch, pl);
+            if (g_summaryScroll >= 0 && ImGui::GetScrollMaxY() > 0) { ImGui::SetScrollY(g_summaryScroll * ImGui::GetScrollMaxY()); g_summaryScroll = -1; }
+        }
         ImGui::EndChild();
     }
     ImGui::End();

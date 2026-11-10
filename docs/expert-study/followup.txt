@@ -1,0 +1,13 @@
+﻿one expert 1.77 MB, one layer of experts 906 MB
+
+1. GPU layers 36-47 (today on the GPU):
+   never picked                    :    86 experts,     152 MB = 0.17 layers of experts; those experts served 0.0000% of all picks
+   <= 0.01% of the layer's picks   :   813 experts,    1439 MB = 1.59 layers of experts; those experts served 0.0555% of all picks
+   <= 0.05%                        :  2066 experts,    3657 MB = 4.04 layers of experts; those experts served 0.8044% of all picks
+   <= 0.1%                         :  3129 experts,    5538 MB = 6.11 layers of experts; those experts served 2.4420% of all picks
+
+2. hot set learned on A, measured on B: hit rate 68.7%; (token, layer) steps with all picks hot: 12.72%; crossings per token if each step with a cold pick needs the CPU: 41.9 (today 36)
+   hot slots per layer: min 109, max 147, layers 0-11: 1553, 36-47: 1526
+
+2. hot set learned on B, measured on A: hit rate 68.1%; (token, layer) steps with all picks hot: 12.60%; crossings per token if each step with a cold pick needs the CPU: 41.9 (today 36)
+   hot slots per layer: min 108, max 149, layers 0-11: 1563, 36-47: 1554

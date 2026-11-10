@@ -257,6 +257,7 @@ void InferenceMode::Probe() {
     if (snap != INVALID_HANDLE_VALUE) {
         PROCESSENTRY32W pe{sizeof(pe)};
         for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe)) {
+            if (pe.cntThreads == 0) continue;   // exited process kept alive by an open handle
             std::string name = ToUtf8(pe.szExeFile);
             HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
             DWORD_PTR pm = 0, sm = 0;
@@ -458,6 +459,7 @@ void InferenceMode::Enforce() {
         if (snap != INVALID_HANDLE_VALUE) {
             PROCESSENTRY32W pe{sizeof(pe)};
             for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe)) {
+                if (pe.cntThreads == 0) continue;   // exited process kept alive by an open handle
                 DWORD pid = pe.th32ProcessID;
                 std::string name = ToUtf8(pe.szExeFile);
                 // Any LlamaScope instance manages its own affinity (E-cores; all cores during hardware tests).
@@ -548,6 +550,7 @@ void InferenceMode::Restore() {
         if (snap != INVALID_HANDLE_VALUE) {
             PROCESSENTRY32W pe{sizeof(pe)};
             for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe)) {
+                if (pe.cntThreads == 0) continue;   // exited process kept alive by an open handle
                 if (pe.th32ProcessID == GetCurrentProcessId() || _wcsicmp(pe.szExeFile, L"LlamaScope.exe") == 0) continue;
                 HANDLE h = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
                 if (!h) continue;

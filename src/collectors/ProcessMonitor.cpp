@@ -34,6 +34,7 @@ void ProcessMonitor::Loop() {
         if (snap != INVALID_HANDLE_VALUE) {
             PROCESSENTRY32W pe{sizeof(pe)};
             for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe)) {
+                if (pe.cntThreads == 0) continue;   // exited process kept alive by an open handle
                 if (pe.th32ProcessID == 0) continue;
                 ProcInfo p;
                 p.pid = pe.th32ProcessID;

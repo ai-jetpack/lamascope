@@ -6,6 +6,7 @@
 #include "tuning/InferenceMode.h"
 #include "core/Settings.h"
 #include "diagnosis/DiagnosisEngine.h"
+#include "model/Profile.h"
 #include "model/Topology.h"
 #include "probes/CpuTopology.h"
 #include "probes/Displays.h"
@@ -76,6 +77,12 @@ public:
     std::vector<std::wstring> modelFiles;   // discovered .gguf files
     void ScanModels();
     void LoadModel(const std::wstring& path);
+
+    // Runtime profile from the ggml profiler (GGML_PROFILE), drawn on the topology diagram.
+    ProfileData profile;
+    static std::wstring ProfilesDir();           // %LOCALAPPDATA%\LlamaScope\profiles
+    void LoadProfile(const std::wstring& path);
+    bool LoadLatestProfile();                    // newest *.prof in ProfilesDir()
 
     // Smoothed clock of loaded cores (>50% busy) and its session maximum, per core type.
     // Raw PDH samples spike above turbo, so the clock rule only uses smoothed values.

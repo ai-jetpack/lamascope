@@ -38,6 +38,6 @@ target_compile_definitions(LlamaScope PRIVATE
 
 target_compile_options(LlamaScope PRIVATE /W3 /utf-8 /permissive- /Zc:__cplusplus)
 
-target_link_libraries(LlamaScope PRIVATE
+target_link_libraries(LlamaScope PRIVATE windowscodecs
     d3d11 dxgi d3dcompiler dwmapi pdh powrprof advapi32 shell32 ole32 comdlg32
 )

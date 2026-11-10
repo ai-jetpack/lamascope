@@ -294,3 +294,31 @@ void App::Frame() {
         ImGui::EndPopup();
     }
 }
+
+std::wstring App::ProfilesDir() {
+    std::wstring d = LocalDataDir() + L"\\profiles";
+    CreateDirectoryW(d.c_str(), nullptr);
+    return d;
+}
+
+void App::LoadProfile(const std::wstring& path) {
+    profile = ProfileData::Load(path);
+    if (profile.ok)
+        Log::I(std::format("Profile: {} generation steps, {:.0f} us per step, {} threads, GPU markers {}", profile.genSteps,
+                           profile.stepUs, profile.threads, profile.hasGpu ? "yes" : "no"));
+    else
+        Log::W("Profile: " + profile.error + " (" + ToUtf8(path) + ")");
+}
+
+bool App::LoadLatestProfile() {
+    WIN32_FIND_DATAW fd, best{};
+    HANDLE h = FindFirstFileW((ProfilesDir() + L"\\*.prof").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    do {
+        if (CompareFileTime(&fd.ftLastWriteTime, &best.ftLastWriteTime) > 0) best = fd;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    if (!best.cFileName[0]) return false;
+    LoadProfile(ProfilesDir() + L"\\" + best.cFileName);
+    return true;
+}
