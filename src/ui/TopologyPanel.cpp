@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <format>
+#include <regex>
 #include "app/App.h"
 #include "core/Log.h"
 #include "core/Util.h"
@@ -46,8 +47,70 @@ std::wstring BrowseForProfile() {
     return GetOpenFileNameW(&ofn) ? std::wstring(file) : std::wstring();
 }
 
+// "Run profiling" button, its progress, and the build folders it needs.
+void Gap() { ImGui::Dummy(ImVec2(0, ImGui::GetFontSize() * 0.6f)); }
+
+void DrawProfileRun(App& app) {
+    auto& r = app.profileRun;
+    auto& s = app.settings;
+    const float f = ImGui::GetFontSize();
+    using S = App::ProfileRun::Stage;
+    const bool idle = r.stage == S::Idle;
+    ImGui::BeginDisabled(!idle);
+    if (ImGui::Button("Run profiling")) app.StartProfileRun();
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Turns on Inference mode (when running as administrator), runs the command line below with the\n"
+                          "profiler-enabled llama.cpp in its own window, loads the profile when llama.cpp exits, then\n"
+                          "restores Inference mode. llama-cli: type prompts in its window and end with /exit.");
+    ImGui::SameLine();
+    if (r.stage == S::Running) {
+        if (ImGui::Button("Stop waiting")) app.StopWaitingProfileRun();
+        ImGui::SameLine();
+    }
+    ImGui::Checkbox("Restore Inference mode afterwards", &r.restoreIm);
+    const bool setupMissing = s.profBin.empty() || App::ProfileScript().empty();
+    ImGui::SameLine();
+    if (ImGui::Button("Profiling setup...")) ImGui::OpenPopup("##profsetup");
+    if (setupMissing) {
+        ImGui::SameLine();
+        ImGui::TextColored(StatusColor(Status::Warn), "set the profiler build folder first");
+    }
+    if (!r.status.empty()) {
+        ImGui::PushTextWrapPos(0);
+        if (r.bad) ImGui::TextColored(StatusColor(Status::Warn), "%s", r.status.c_str());
+        else if (idle) ImGui::TextColored(StatusColor(Status::Ok), "%s", r.status.c_str());
+        else ImGui::TextUnformatted(r.status.c_str());
+        if (!r.note.empty()) ImGui::TextDisabled("%s", r.note.c_str());
+        ImGui::PopTextWrapPos();
+    }
+    if (ImGui::BeginPopup("##profsetup")) {
+        bool changed = false;
+        auto path = [&](const char* label, std::string& v, const char* hint) {
+            char b[MAX_PATH * 2];
+            strncpy_s(b, v.c_str(), _TRUNCATE);
+            ImGui::SetNextItemWidth(f * 32);
+            if (ImGui::InputTextWithHint(label, hint, b, sizeof b)) { v = b; changed = true; }
+        };
+        path("llama.cpp profiler build", s.profBin, "<llama.cpp-prof>\\build-prof\\bin (llama-cli.exe, ggml*.dll)");
+        if (!s.profBin.empty() && GetFileAttributesW((ToWide(s.profBin) + L"\\llama-cli.exe").c_str()) == INVALID_FILE_ATTRIBUTES)
+            ImGui::TextColored(StatusColor(Status::Warn), "llama-cli.exe not found in that folder");
+        path("CUDA runtime (optional)", s.cudaBin, "<CUDA toolkit>\\bin, if its DLLs are not on PATH");
+        int mode = s.profMode == "op" ? 1 : 0;
+        ImGui::SetNextItemWidth(f * 8);
+        if (ImGui::Combo("record", &mode, "per block\0per operation\0")) { s.profMode = mode ? "op" : "block"; changed = true; }
+        std::wstring script = App::ProfileScript();
+        if (script.empty()) ImGui::TextColored(StatusColor(Status::Warn), "scripts\\Profile-Llama.ps1 not found");
+        else ImGui::TextDisabled("Script: %s", ToUtf8(script).c_str());
+        ImGui::TextDisabled("Build the profiler-enabled llama.cpp: see README, \"Recording a runtime profile\".");
+        if (changed) s.Save();
+        ImGui::EndPopup();
+    }
+}
+
 // Measured runtime (ggml profiler output): totals per generation step and expert usage across all layers.
 void DrawProfileSummary(App& app, const ModelInfo& m) {
+    Gap();
     ImGui::SeparatorText("Runtime profile (measured)");
     if (ImGui::Button("Open profile...")) {
         std::wstring p = BrowseForProfile();
@@ -763,6 +826,7 @@ void DrawSummary(App& app, const ModelInfo& m, LaunchParams& lp, const Placement
     int attn = m.CountMixer(MixerKind::Attention), lin = m.CountMixer(MixerKind::Linear);
     ImGui::PushTextWrapPos(0);
 
+    Gap();
     ImGui::SeparatorText("Model");
     ImGui::TextUnformatted(m.name.c_str());
     ImGui::TextDisabled("%s, %.1fB parameters, %s file", m.sizeLabel.c_str(), m.nParams / 1e9, MB((double)m.fileSize).c_str());
@@ -770,6 +834,7 @@ void DrawSummary(App& app, const ModelInfo& m, LaunchParams& lp, const Placement
     if (lin) ImGui::Text("%d layers keep a KV cache, %d keep a small fixed-size state", attn, lin);
     if (m.nExpert) ImGui::Text("Each layer has %d experts; %d are picked per token, plus 1 always-on", m.nExpert, m.nExpertUsed);
 
+    Gap();
     ImGui::SeparatorText("Per generated token");
     ImGui::TextColored(kCpu, "CPU reads %s of weights", MB(pl.cpuBytesPerToken).c_str());
     ImGui::TextColored(kGpu, "GPU reads %s of weights", MB(pl.gpuBytesPerToken).c_str());
@@ -779,6 +844,7 @@ void DrawSummary(App& app, const ModelInfo& m, LaunchParams& lp, const Placement
     ImGui::TextColored(kPcie, "%d GPU<->CPU hand-offs", pl.crossingsPerToken);
     ImGui::TextDisabled("Stored: GPU %s, CPU %s", MB((double)pl.gpuWeights).c_str(), MB((double)pl.cpuWeights).c_str());
 
+    Gap();
     ImGui::SeparatorText("VRAM budget");
     double total = (double)gs.vramTotal, others = (double)OtherProcessesVram(app);
     const auto& kv = KvTypes();
@@ -801,6 +867,7 @@ void DrawSummary(App& app, const ModelInfo& m, LaunchParams& lp, const Placement
         if (m.nExpert && fit >= 0) ImGui::TextDisabled("Smallest --n-cpu-moe that fits (0.25 GB margin): %d", fit);
     }
 
+    Gap();
     ImGui::SeparatorText("Bandwidth ceiling (upper bound, not a prediction)");
     bool measured = false;
     double cpuBw = CpuBandwidth(app, &measured), gpuBw = gs.VramGBs() * 1e9;
@@ -821,6 +888,7 @@ void DrawSummary(App& app, const ModelInfo& m, LaunchParams& lp, const Placement
     }
 
     if (m.nExpert) {
+        Gap();
         ImGui::SeparatorText("What if --n-cpu-moe ...");
         int lo = std::max(0, std::min(lp.nCpuMoe, fit < 0 ? lp.nCpuMoe : fit) - 2);
         int hi = std::min(m.nLayers, lo + 7);
@@ -872,13 +940,47 @@ void DrawParams(App& app, const ModelInfo& m) {
     auto& p = app.settings.launch;
     float f = ImGui::GetFontSize();
     bool changed = false;
+
+    // --- Paste a full command line -------------------------------------------------------------------
+    static char buf[4096] = {};
+    static bool init = false;
+    if (!init) { strncpy_s(buf, p.cmdline.c_str(), _TRUNCATE); init = true; }
+    ImGui::TextUnformatted("llama.cpp command line");
+    ImGui::SameLine();
+    ImGui::TextDisabled("(paste it, then Apply: the flags below and the diagram follow it)");
+    ImGui::SetNextItemWidth(-f * 9);
+    ImGui::InputTextMultiline("##cmdline", buf, sizeof buf, ImVec2(-f * 9, f * 3.2f));
+    ImGui::SameLine();
+    ImGui::BeginGroup();
+    bool fromFlag = !g_applyCmdline.empty();
+    if (fromFlag) { strncpy_s(buf, g_applyCmdline.c_str(), _TRUNCATE); g_applyCmdline.clear(); }
+    if (ImGui::Button("Apply", ImVec2(f * 8, 0)) || fromFlag) {
+        LaunchParams np;   // a pasted line replaces everything: flags it does not set take llama.cpp defaults
+        np.ctk = np.ctv = 0;
+        ParsedArgs last = ParseLlamaArgs(buf, np);
+        np.cmdline = buf;
+        p = np;
+        changed = true;
+        if (!last.model.empty()) {
+            std::wstring w = ToWide(last.model);
+            if (GetFileAttributesW(w.c_str()) != INVALID_FILE_ATTRIBUTES && ToWide(m.path) != w) app.LoadModel(w);
+        }
+    }
+    if (ImGui::Button("Clear", ImVec2(f * 8, 0))) buf[0] = 0;
+    ImGui::EndGroup();
+
+    // --- Individual flags ----------------------------------------------------------------------------
     auto width = [&](float field, const char* label) { return field + ImGui::CalcTextSize(label).x + f * 0.5f; };
     ImGui::SetNextItemWidth(f * 5.5f);
     changed |= ImGui::InputInt("-ngl", &p.ngl, 0, 0);
     if (m.nExpert) {
         Flow(width(f * 9, "--n-cpu-moe"));
+        ImGui::BeginDisabled(p.cpuMoe);
         ImGui::SetNextItemWidth(f * 9);
         changed |= ImGui::SliderInt("--n-cpu-moe", &p.nCpuMoe, 0, m.nLayers);
+        ImGui::EndDisabled();
+        Flow(width(f * 1.5f, "--cpu-moe"));
+        changed |= ImGui::Checkbox("--cpu-moe", &p.cpuMoe);
     }
     Flow(width(f * 5.5f, "-c"));
     ImGui::SetNextItemWidth(f * 5.5f);
@@ -901,6 +1003,24 @@ void DrawParams(App& app, const ModelInfo& m) {
     Flow(width(f * 3.5f, "-np"));
     ImGui::SetNextItemWidth(f * 3.5f);
     changed |= ImGui::InputInt("-np", &p.nParallel, 0, 0);
+
+    // -ot rules: shown with how many bytes each moves (first matching rule wins, as in llama.cpp)
+    if (!p.overrides.empty()) {
+        ImGui::TextUnformatted("-ot rules:");
+        for (size_t i = 0; i < p.overrides.size(); ++i) {
+            ImGui::SameLine();
+            ImGui::PushID((int)i);
+            bool bad = false;
+            try { std::regex re(p.overrides[i].first); } catch (const std::regex_error&) { bad = true; }
+            std::string label = p.overrides[i].first + " = " + p.overrides[i].second + (bad ? "  (invalid regex)" : "");
+            if (bad) ImGui::TextColored(StatusColor(Status::Bad), "%s", label.c_str());
+            else ImGui::TextDisabled("%s", label.c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x")) { p.overrides.erase(p.overrides.begin() + i); changed = true; ImGui::PopID(); break; }
+            ImGui::PopID();
+        }
+    }
+
     if (changed) {
         p.ngl = std::clamp(p.ngl, 0, 999);
         p.nCpuMoe = std::clamp(p.nCpuMoe, 0, m.nLayers);
@@ -941,11 +1061,29 @@ void DrawTopologyPanel(App& app) {
         ImGui::End();
         return;
     }
-    DrawParams(app, m);
+    Gap();
+    DrawProfileRun(app);
+    Gap();
+    {
+        const auto& lp = app.settings.launch;
+        const auto& kv = KvTypes();
+        std::string sum = std::format("-ngl {}", lp.ngl);
+        if (m.nExpert) sum += lp.cpuMoe ? "  --cpu-moe" : std::format("  --n-cpu-moe {}", lp.nCpuMoe);
+        sum += std::format("  -c {}  -ctk {}  -ctv {}  -ub {}  -np {}", lp.nCtx, kv[lp.ctk].name, kv[lp.ctv].name,
+                           lp.nUbatch, lp.nParallel);
+        if (!lp.overrides.empty()) sum += std::format("  -ot x{}", lp.overrides.size());
+        ImGui::SetNextItemOpen(true, g_applyCmdline.empty() ? ImGuiCond_Once : ImGuiCond_Always);
+        if (ImGui::CollapsingHeader(("Model parameters      " + sum + "###params").c_str())) {
+            ImGui::Indent(f * 0.5f);
+            DrawParams(app, m);
+            ImGui::Unindent(f * 0.5f);
+        }
+    }
     Placement pl = Placement::Compute(m, app.settings.launch);
     selected = std::clamp(selected, 0, (int)m.layers.size() - 1);
 
     static int scrollTo = -1;
+    Gap();
     Legend();
     ImGui::SeparatorText("Model pipeline: the cursor follows the diagram below (click a layer to jump)");
     DrawPipeline(m, pl, selected, scrollTo);

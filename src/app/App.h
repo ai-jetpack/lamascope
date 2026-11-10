@@ -84,6 +84,24 @@ public:
     void LoadProfile(const std::wstring& path);
     bool LoadLatestProfile();                    // newest *.prof in ProfilesDir()
 
+    // "Run profiling" (app/ProfileRun.cpp): Inference mode on, scripts\Profile-Llama.ps1 in its own console with
+    // the pasted command line, wait for llama.cpp to exit, load the new profile, restore Inference mode.
+    struct ProfileRun {
+        enum class Stage { Idle, EnteringIm, Running, Restoring } stage = Stage::Idle;
+        bool restoreIm = true;       // restore Inference mode afterwards (only if this run turned it on)
+        bool enteredIm = false;
+        void* proc = nullptr;        // HANDLE
+        unsigned long long startFt = 0;   // FILETIME of the start
+        std::string tool, status, note;
+        bool bad = false;
+        double startAt = 0;          // deferred start (command line --run-profiling)
+    };
+    ProfileRun profileRun;
+    static std::wstring ProfileScript();         // "" if not found
+    void StartProfileRun();
+    void UpdateProfileRun();                     // per frame
+    void StopWaitingProfileRun();
+
     // Smoothed clock of loaded cores (>50% busy) and its session maximum, per core type.
     // Raw PDH samples spike above turbo, so the clock rule only uses smoothed values.
     struct ClockTrack { float ema = 0, ref = 0; int loaded = 0; };
@@ -91,6 +109,8 @@ public:
     std::vector<float> EffectiveMhz() const;   // per logical processor
 
 private:
+    void LaunchProfileRun();
+    void ProfileRunFail(const std::string& why);
     void DrawMenuBar();
     void BuildDefaultLayout(unsigned dockId);
     bool needLayout_ = false;

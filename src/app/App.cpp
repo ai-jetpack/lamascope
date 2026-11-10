@@ -255,6 +255,7 @@ void App::Frame() {
     }
 
     UpdateHardwareCheck();
+    UpdateProfileRun();
     diag.Update(*this);
 
     DrawMenuBar();

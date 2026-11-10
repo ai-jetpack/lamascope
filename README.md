@@ -75,7 +75,9 @@ cmake --build build-prof --target llama-cli llama-bench llamascope-batch
 
 (`LLAMA_BUILD_SERVER=ON` is needed because `llama-cli` shares code with the server.)
 
-**2. Run llama-cli through the helper script** (PowerShell, from the LlamaScope folder):
+**2a. From LlamaScope:** in **Model topology**, paste your llama-cli command line and press **Apply**. Press **Profiling setup...** next to **Run profiling** and set the `build-prof\bin` folder (and the CUDA `bin` folder if its DLLs are not on PATH). Then press **Run profiling**. It turns on Inference mode (when LlamaScope runs as administrator) and starts llama-cli from the profiler build in its own window with all cores available. Type your prompts there and end with `/exit`, or add `-p "<prompt>" -n <tokens> -st` for a single non-interactive turn. When llama-cli exits, LlamaScope loads the profile and restores Inference mode. The executable named in the pasted line is ignored: it always runs `llama-cli`.
+
+**2b. Or run llama-cli through the helper script** (PowerShell, from the LlamaScope folder):
 
 ```
 $env:LLAMACPP_PROF_BIN = "<path>\llama.cpp-prof\build-prof\bin"

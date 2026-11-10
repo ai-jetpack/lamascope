@@ -20,11 +20,17 @@ void DrawPlatformDetails(App& app, bool* open);
 
 // One-shot scroll requests (command line, for snapshots): topology diagram at layer.fraction, summary at fraction.
 inline float g_topologyScroll = -1, g_summaryScroll = -1;
+inline std::string g_applyCmdline;   // --cmdline "<llama.cpp command>": applied as if pasted
 
 // Hardware verdict rows, shared by the Hardware and Diagnosis panels.
+// Machine: fixed facts (Platform details). Setting: configuration that can be changed. Test: measured by Run tests.
+// Runtime: live readings. Settings, tests and runtime rows are shown in the Hardware panel.
+enum class HwKind { Machine, Setting, Test, Runtime };
+
 struct HwRow {
     std::string section, label, value, spec;
     Verdict verdict;
+    HwKind kind = HwKind::Machine;
 };
 std::vector<HwRow> BuildHardwareRows(App& app);
 

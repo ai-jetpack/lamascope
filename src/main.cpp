@@ -151,6 +151,12 @@ void ApplyTheme(float scale) {
     c[ImGuiCol_TitleBg] = ImVec4(0.06f, 0.07f, 0.09f, 1);
     c[ImGuiCol_TitleBgActive] = ImVec4(0.10f, 0.12f, 0.16f, 1);
     c[ImGuiCol_TableRowBgAlt] = ImVec4(1, 1, 1, 0.03f);
+    // input boxes, sliders, combos: a lighter fill and a border so they stand out from the window
+    s.FrameBorderSize = 1;
+    c[ImGuiCol_FrameBg] = ImVec4(0.16f, 0.18f, 0.23f, 1);
+    c[ImGuiCol_FrameBgHovered] = ImVec4(0.21f, 0.24f, 0.31f, 1);
+    c[ImGuiCol_FrameBgActive] = ImVec4(0.25f, 0.29f, 0.38f, 1);
+    c[ImGuiCol_Border] = ImVec4(0.36f, 0.40f, 0.48f, 0.85f);
     s.ScaleAllSizes(scale);
     s.FontScaleDpi = scale;
 }
@@ -334,9 +340,15 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int) {
     App app;
     app.Init(firstRun);
     if (cmdLine && wcsstr(cmdLine, L"--run-tests")) app.hwCheck.startAt = NowSeconds() + 5;   // after startup settles
+    if (cmdLine && wcsstr(cmdLine, L"--cmdline \"")) {
+        const wchar_t* a = wcsstr(cmdLine, L"--cmdline \"") + 11;
+        const wchar_t* e = wcschr(a, L'"');
+        g_applyCmdline = ToUtf8(std::wstring(a, e ? e : a + wcslen(a)));
+    }
     if (cmdLine && wcsstr(cmdLine, L"--topology-scroll ")) g_topologyScroll = (float)_wtof(wcsstr(cmdLine, L"--topology-scroll ") + 18);
     if (cmdLine && wcsstr(cmdLine, L"--summary-scroll ")) g_summaryScroll = (float)_wtof(wcsstr(cmdLine, L"--summary-scroll ") + 17);
     if (cmdLine && wcsstr(cmdLine, L"--profile-latest")) app.LoadLatestProfile();
+    if (cmdLine && wcsstr(cmdLine, L"--run-profiling")) app.profileRun.startAt = NowSeconds() + 3;
     else if (cmdLine && wcsstr(cmdLine, L"--profile ")) {
         std::wstring p = wcsstr(cmdLine, L"--profile ") + 10;
         if (!p.empty() && p.front() == L'"') p = p.substr(1, p.find(L'"', 1) - 1);

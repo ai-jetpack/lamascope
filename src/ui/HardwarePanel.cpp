@@ -144,6 +144,19 @@ void AddPcieRows(App& app, std::vector<HwRow>& rows) {
 
     int gSeen = app.nvml.MaxGenSeen(), wSeen = app.nvml.MaxWidthSeen();
     bool evaluated = app.nvml.MaxUtilSeen() >= 20 || app.pcieTest.Result().valid;
+    // The 100 ms NVML sampler can miss the short copy bursts of the PCIe test and keep the idle generation.
+    // A measured copy speed above what that generation can carry proves the link ran faster: infer the lowest
+    // generation that can carry it.
+    std::string inferred;
+    if (auto pr = app.pcieTest.Result(); pr.valid && wSeen > 0) {
+        const double measured = std::max(pr.h2dGBs, pr.d2hGBs);
+        if (measured > LaneGBs(gSeen) * wSeen) {
+            int g = gSeen;
+            while (g < 6 && LaneGBs(g) * wSeen < measured) ++g;
+            gSeen = g;
+            inferred = std::format(" (from the measured {:.1f} GB/s; the link-state sample missed the copies)", measured);
+        }
+    }
     Verdict lv{Status::Unavailable, "press Run tests (the link slows down at idle; the test brings it to full speed)"};
     if (evaluated) {
         if (wSeen < cardWidth)
@@ -155,7 +168,7 @@ void AddPcieRows(App& app, std::vector<HwRow>& rows) {
                                             "setting, riser cable?)",
                                             gSeen, cardGen)};
         else
-            lv = {Status::Ok, "full link width and generation reached under load"};
+            lv = {Status::Ok, "full link width and generation reached under load" + inferred};
     }
     std::string spec = std::format("card Gen{} x{}", cardGen, cardWidth);
     if (!st.cardWidthNote.empty()) spec += " (" + st.cardWidthNote + ")";
@@ -335,6 +348,30 @@ void AddSystemRows(App& app, std::vector<HwRow>& rows) {
 
 } // namespace
 
+namespace {
+
+HwKind KindOf(const HwRow& r) {
+    const std::string& s = r.section;
+    const std::string& l = r.label;
+    auto is = [&](const char* sec, const char* lab) { return s == sec && l == lab; };
+    if (l.find("all cores busy") != std::string::npos || is("Memory", "Measured bandwidth") ||
+        is("PCIe", "Link under load") || is("PCIe", "Measured copy speed"))
+        return HwKind::Test;
+    if (is("GPU", "VRAM") || is("GPU", "Graphics clock") || is("GPU", "Memory clock") || is("GPU", "Power") ||
+        is("GPU", "Temperature") || is("GPU", "Clock limiters") || is("PCIe", "Link now") || is("PCIe", "Traffic now") ||
+        is("Display", "VRAM used by others") || is("System", "Competing for P-cores"))
+        return HwKind::Runtime;
+    if (is("Memory", "Speed") || is("GPU", "Resizable BAR") || is("GPU", "NVIDIA GPU") ||
+        is("Display", "Inference GPU drives display") || (s == "System" && l != "Windows"))
+        return HwKind::Setting;
+    // a fact that comes with a problem (e.g. integrated GPU disabled in BIOS) is something to change: show it too
+    const Status st = r.verdict.status;
+    if (st == Status::Bad || st == Status::Warn || st == Status::Info) return HwKind::Setting;
+    return HwKind::Machine;
+}
+
+} // namespace
+
 std::vector<HwRow> BuildHardwareRows(App& app) {
     std::vector<HwRow> rows;
     AddCpuRows(app, rows);
@@ -343,10 +380,12 @@ std::vector<HwRow> BuildHardwareRows(App& app) {
     AddPcieRows(app, rows);
     AddDisplayRows(app, rows);
     AddSystemRows(app, rows);
+    for (auto& r : rows) r.kind = KindOf(r);
     return rows;
 }
 
-// Hardware panel: checks only (measured vs spec), frozen at the last "Run tests". Facts live in Platform details.
+// Hardware panel: test results and settings (frozen at the last "Run tests") and runtime readings (every 2 s).
+// Fixed machine facts live in Platform details.
 void DrawHardwarePanel(App& app) {
     if (!ImGui::Begin(Win::Hardware)) { ImGui::End(); return; }
     const float em = ImGui::GetFontSize();
@@ -392,22 +431,31 @@ void DrawHardwarePanel(App& app) {
     else if (!hc.skipped.empty() && !running)
         ImGui::TextDisabled("Last run skipped the tests (%s was computing).", hc.skipped.c_str());
 
-    // --- Verdicts (frozen) -------------------------------------------------------------------------
-    std::vector<const HwRow*> bad, todo, notes, ok;
-    for (const auto& r : hc.rows) {
-        switch (r.verdict.status) {
-        case Status::Bad: bad.insert(bad.begin(), &r); break;
-        case Status::Warn: bad.push_back(&r); break;
-        case Status::Unavailable: todo.push_back(&r); break;
-        case Status::Info: notes.push_back(&r); break;
-        case Status::Ok: ok.push_back(&r); break;
-        default: break;
-        }
+    // --- Rows -------------------------------------------------------------------------------------
+    // Tests and settings: frozen at the last Run tests. Runtime: rebuilt every 2 s (readable, not flickering).
+    static std::vector<HwRow> live;
+    static double liveAt = -1;
+    if (NowSeconds() - liveAt >= 2.0) {
+        live = BuildHardwareRows(app);
+        liveAt = NowSeconds();
     }
+    auto rank = [](Status s) { return s == Status::Bad ? 0 : s == Status::Warn ? 1 : s == Status::Info ? 2 : s == Status::Unavailable ? 3 : 4; };
+    auto pick = [&](const std::vector<HwRow>& src, HwKind k) {
+        std::vector<const HwRow*> out;
+        for (const auto& r : src)
+            if (r.kind == k) out.push_back(&r);
+        std::stable_sort(out.begin(), out.end(), [&](const HwRow* a, const HwRow* b) { return rank(a->verdict.status) < rank(b->verdict.status); });
+        return out;
+    };
+    const auto tests = pick(hc.rows, HwKind::Test), settings = pick(hc.rows, HwKind::Setting), runtime = pick(live, HwKind::Runtime);
+    int notAtSpec = 0;
+    for (const auto* list : {&tests, &settings, &runtime})
+        for (const HwRow* r : *list) notAtSpec += r->verdict.status == Status::Bad || r->verdict.status == Status::Warn;
 
-    // Rows: dot | what | measured, aligned across all groups; the reason wraps underneath at full width.
+    // Rows: dot | what | value, aligned across all sections; reasons of rows not at spec wrap underneath.
     float labelW = 0;
-    for (const auto& r : hc.rows) labelW = std::max(labelW, ImGui::CalcTextSize(r.label.c_str()).x);
+    for (const auto* list : {&tests, &settings, &runtime})
+        for (const HwRow* r : *list) labelW = std::max(labelW, ImGui::CalcTextSize(r->label.c_str()).x);
     const float textX = em * 1.4f;
     const float valueX = textX + std::min(labelW + em * 1.5f, ImGui::GetContentRegionAvail().x * 0.55f);
     auto table = [&](const char*, const std::vector<const HwRow*>& list, bool reasons) {
@@ -423,7 +471,8 @@ void DrawHardwarePanel(App& app) {
             ImGui::TextUnformatted(r->value.c_str());
             ImGui::PopTextWrapPos();
             if (ImGui::IsItemHovered() && !r->spec.empty()) ImGui::SetTooltip("%s", r->spec.c_str());
-            if (reasons && !r->verdict.reason.empty()) {
+            const Status st = r->verdict.status;
+            if (reasons && !r->verdict.reason.empty() && st != Status::Ok && st != Status::None) {
                 ImGui::Indent(textX);
                 ImGui::PushTextWrapPos(0);
                 ImGui::TextDisabled("%s", r->verdict.reason.c_str());
@@ -435,31 +484,27 @@ void DrawHardwarePanel(App& app) {
         }
     };
 
-    ImGui::BeginChild("##verdicts", ImVec2(0, 0), ImGuiChildFlags_None);
-    ImGui::SeparatorText(std::format("Not at spec ({})", bad.size()).c_str());
-    if (bad.empty()) ImGui::TextDisabled(hc.lastRun > 0 ? "Nothing: everything checked runs at spec."
-                                                        : "Nothing found in the configuration.");
-    table("##bad", bad, true);
-
-    if (!todo.empty()) {
-        ImGui::SeparatorText(std::format("Not measured ({})", todo.size()).c_str());
-        table("##todo", todo, false);
-    }
-    if (!notes.empty()) {
-        ImGui::SeparatorText(std::format("Notes ({})", notes.size()).c_str());
-        table("##notes", notes, true);
-    }
-    ImGui::Spacing();
-    if (ImGui::CollapsingHeader(std::format("At spec ({})###atspec", ok.size()).c_str())) table("##ok", ok, false);
+    ImGui::BeginChild("##rows", ImVec2(0, 0), ImGuiChildFlags_None);
+    if (notAtSpec)
+        ImGui::TextColored(StatusColor(Status::Warn), "%d item%s not at spec (listed first in each section)", notAtSpec, notAtSpec > 1 ? "s" : "");
+    else
+        ImGui::TextColored(StatusColor(Status::Ok), "Everything checked runs at spec");
+    ImGui::SeparatorText("Test results (last Run tests)");
+    table("##tests", tests, true);
+    ImGui::SeparatorText("Settings");
+    table("##settings", settings, true);
+    ImGui::SeparatorText("Runtime (updated every 2 s)");
+    table("##runtime", runtime, true);
     ImGui::EndChild();
     ImGui::End();
 }
 
-// Every probed fact, grouped by component.
+// Fixed machine facts, grouped by component (settings, test results and runtime readings are in the Hardware panel).
 void DrawPlatformDetails(App& app, bool* visible) {
     ImGui::SetNextWindowSize(ImVec2(ImGui::GetFontSize() * 48, ImGui::GetFontSize() * 40), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin("Platform details", visible)) { ImGui::End(); return; }
     auto rows = BuildHardwareRows(app);
+    rows.erase(std::remove_if(rows.begin(), rows.end(), [](const HwRow& r) { return r.kind != HwKind::Machine; }), rows.end());
     // Static extras not used by any check.
     auto memEnd = std::find_if(rows.rbegin(), rows.rend(), [](const HwRow& r) { return r.section == "Memory"; }).base();
     std::vector<HwRow> dimms;

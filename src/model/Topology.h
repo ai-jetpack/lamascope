@@ -42,11 +42,25 @@ const std::vector<KvType>& KvTypes();
 struct LaunchParams {
     int ngl = 999;
     int nCpuMoe = 0;
+    bool cpuMoe = false;    // --cpu-moe: experts of all layers on the CPU
     int nCtx = 16384;
+    int nBatch = 2048;
     int nUbatch = 512;
     int nParallel = 1;
     int ctk = 0, ctv = 0;   // indices into KvTypes()
+    std::vector<std::pair<std::string, std::string>> overrides;   // -ot / --override-tensor: regex -> buffer
+    std::string cmdline;    // last pasted llama.cpp command line
 };
+
+// Parses a llama.cpp command line into p. Lists what was applied, what has no effect on placement, what affects
+// placement but is not modeled, and what is unknown.
+struct ParsedArgs {
+    std::vector<std::string> applied, noEffect, notModeled, unknown;
+    std::string model;      // -m / --model
+};
+ParsedArgs ParseLlamaArgs(const std::string& cmdline, LaunchParams& p);
+// Splits a command line: whitespace separates, '...' and "..." group, ^ and ` (line continuations) are dropped.
+std::vector<std::string> TokenizeArgs(const std::string& cmdline);
 
 struct Placement {
     std::vector<std::array<Device, kBlocks>> dev;   // per layer, per block
